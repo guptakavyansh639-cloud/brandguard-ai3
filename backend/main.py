@@ -266,15 +266,23 @@ async def analyze_guardrail(req: AnalyzeRequest):
                 img_bytes = base64.b64decode(raw_b64)
                 contents.append(types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"))
 
-            resp = client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=GeminiStructuredEval,
-                    temperature=0.1,
-                ),
-            )
+            resp = None
+            for model_id in ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-2.5-flash"]:
+                try:
+                    resp = client.models.generate_content(
+                        model=model_id,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            response_schema=GeminiStructuredEval,
+                            temperature=0.1,
+                        ),
+                    )
+                    break
+                except Exception:
+                    continue
+            if resp is None:
+                raise RuntimeError("All Gemini models exhausted")
             llm_data = GeminiStructuredEval.model_validate_json(resp.text)
             risk_score = max(risk_score, llm_data.risk_score)
             confidence_score = llm_data.confidence_score
