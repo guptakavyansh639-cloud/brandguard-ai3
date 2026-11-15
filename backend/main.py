@@ -224,9 +224,13 @@ def serialize_submission(s: SubmissionORM) -> dict[str, Any]:
 app = FastAPI(title="BrandGuard AI Enterprise Gateway", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=True,
+    allow_origins=[
+        "https://brandguard-frontend-coral.vercel.app",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "*"
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
