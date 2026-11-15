@@ -1,3 +1,4 @@
+from pydantic import BaseModel, Field, AliasChoices
 import base64
 import hashlib
 import hmac
@@ -251,7 +252,7 @@ class LoginRequest(BaseModel):
 
 
 class EvaluateRequest(BaseModel):
-    content: str = Field(..., min_length=1, max_length=12000)
+    content: str = Field(..., min_length=1, max_length=12000, validation_alias=AliasChoices("content", "text"))
     content_type: str = Field(default="text")
     image_base64: Optional[str] = None
     model_preference: str = Field(default="auto", description="auto, gemini-2.5-flash, or gemini-2.5-pro")
