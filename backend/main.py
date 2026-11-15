@@ -624,3 +624,11 @@ def readiness(db: Session = Depends(get_db)):
     except Exception:
         logger.exception("Readiness check failed")
         raise HTTPException(status_code=503, detail="Database unavailable")
+    # ============================= Frontend Route Aliases =============================
+@app.post("/api/auth/token")
+def api_login_alias(payload: LoginRequest):
+    return login_for_token(payload)
+
+@app.post("/api/review/analyze")
+async def api_evaluate_alias(payload: EvaluateRequest, request: Request, db: Session = Depends(get_db)):
+    return await evaluate_content(payload, request, db)
