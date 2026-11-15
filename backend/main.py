@@ -632,3 +632,6 @@ def api_login_alias(payload: LoginRequest):
 @app.post("/api/review/analyze")
 async def api_evaluate_alias(payload: EvaluateRequest, request: Request, db: Session = Depends(get_db)):
     return await evaluate_content(payload, request, db)
+@app.post("/api/auth/login")
+def api_login_alias_v2(payload: LoginRequest):
+    return login_for_token(payload)
