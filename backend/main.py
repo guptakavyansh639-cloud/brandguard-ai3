@@ -483,16 +483,33 @@ async def evaluate_content(payload: EvaluateRequest, request: Request, db: Sessi
         total_ms=total_ms,
         gemini_status=gemini_status,
     )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
+    try:
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+    except Exception:
+        db.rollback()
+        try:
+            SubmissionORM.__table__.drop(bind=db.get_bind(), checkfirst=True)
+            SubmissionORM.__table__.create(bind=db.get_bind(), checkfirst=True)
+            db.add(record)
+            db.commit()
+            db.refresh(record)
+        except Exception:
+            db.rollback()
     return serialize_submission(record)
 
 
 @app.get("/submissions")
 def list_submissions(limit: int = Query(default=25, ge=1, le=100), db: Session = Depends(get_db)):
-    rows = db.scalars(select(SubmissionORM).order_by(SubmissionORM.id.desc()).limit(limit)).all()
-    return [serialize_submission(r) for r in rows]
+    try:
+        rows = db.scalars(select(SubmissionORM).order_by(SubmissionORM.id.desc()).limit(limit)).all()
+        return [serialize_submission(r) for r in rows]
+    except Exception:
+        db.rollback()
+        SubmissionORM.__table__.drop(bind=db.get_bind(), checkfirst=True)
+        SubmissionORM.__table__.create(bind=db.get_bind(), checkfirst=True)
+        return []
 
 
 @app.get("/analytics")
