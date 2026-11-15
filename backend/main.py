@@ -24,7 +24,7 @@ from starlette.concurrency import run_in_threadpool
 try:
     from google import genai
     from google.genai import types as genai_types
-except ImportError:  # Local deterministic mode remains available without Gemini package.
+except ImportError:
     genai = None
     genai_types = None
 
@@ -41,22 +41,17 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 JWT_SECRET = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM = "HS256"
 JWT_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
-CORS_ORIGINS = [x.strip() for x in os.getenv(
-    "CORS_ORIGINS", "https://brandguard-frontend-coral.vercel.app"
-).split(",") if x.strip()]
+CORS_ORIGINS = [
+    "https://brandguard-frontend-coral.vercel.app",
+    "https://brandguard-frontend-g3eno85fy-acers24.vercel.app",
+    "https://brandguard-frontend.vercel.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "12000"))
 MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
 AUTH_REQUIRED_FOR_READS = os.getenv("AUTH_REQUIRED_FOR_READS", "false").lower() == "true"
-
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
-logger = logging.getLogger("brandguard")
-
-if not JWT_SECRET:
-    # Works for local development, but Render deployment must set a persistent secret.
-    JWT_SECRET = secrets.token_urlsafe(48)
-    logger.warning("JWT_SECRET not set; generated temporary secret. Set JWT_SECRET in production.")
-
 engine_kwargs: dict[str, Any] = {"pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite"):
     engine_kwargs["connect_args"] = {"check_same_thread": False}
@@ -367,10 +362,16 @@ def _submission_dict(s: Submission) -> dict[str, Any]:
             "telemetry": {"stage1_regex_ms": s.stage1_ms, "stage2_gemini_ms": s.stage2_ms, "total_ms": s.total_ms,
                           "gemini_status": s.gemini_status}, "latency_ms": s.total_ms, "created_at": created}
 
-# ----------------------------- App and middleware -------------------------
+# ----------------------------- App and middleware -----------------------------
 app = FastAPI(title="BrandGuard AI Enterprise Gateway", version=APP_VERSION)
-app.add_middleware(CORSMiddleware, allow_origins=CORS_ORIGINS, allow_credentials=True,
-                   allow_methods=["GET", "POST", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _rate_buckets: dict[str, deque[float]] = defaultdict(deque)
 def rate_limit(request: Request):
