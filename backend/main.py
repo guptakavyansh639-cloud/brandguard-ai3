@@ -325,6 +325,7 @@ def login_for_token(payload: LoginRequest):
     exp = datetime.now(timezone.utc) + timedelta(minutes=JWT_MINUTES)
     token = jwt.encode({"sub": payload.username, "exp": exp, "role": "admin"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
     return {"access_token": token, "token": token, "token_type": "bearer", "expires_in_minutes": JWT_MINUTES, "username": payload.username, "role": "admin"}
+    
 
 @app.get("/rules")
 def list_rules(db: Session = Depends(get_db)):
@@ -583,6 +584,26 @@ async def api_evaluate_alias_1(payload: EvaluateRequest, request: Request, db: S
 @app.post("/api/evaluate")
 async def api_evaluate_alias_2(payload: EvaluateRequest, request: Request, db: Session = Depends(get_db)):
     return await evaluate_content(payload, request, db)
+@app.get("/api/review/analytics")
+@app.get("/api/analytics")
+def api_analytics_alias(db: Session = Depends(get_db)):
+    return get_analytics(db)
+
+@app.get("/api/review/logs")
+@app.get("/api/review/submissions")
+@app.get("/api/submissions")
+def api_logs_alias(limit: int = Query(default=25, ge=1, le=100), db: Session = Depends(get_db)):
+    return list_submissions(limit=limit, db=db)
+
+@app.get("/api/review/rules")
+@app.get("/api/rules")
+def api_rules_get_alias(db: Session = Depends(get_db)):
+    return list_rules(db)
+
+@app.post("/api/review/rules")
+@app.post("/api/rules")
+def api_rules_post_alias(payload: RuleCreateRequest, db: Session = Depends(get_db)):
+    return create_rule(payload, db)
 @app.get("/api/review/analytics")
 @app.get("/api/analytics")
 def api_analytics_alias(db: Session = Depends(get_db)):
