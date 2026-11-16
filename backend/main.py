@@ -282,7 +282,7 @@ app = FastAPI(title="BrandGuard AI Enterprise Gateway", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://brandguard-frontend-coral.vercel.app",
+        "https://brandguard-frontend-coral.vercel.app","https://brandguard-ai.vercel.app"
         "http://localhost:3000",
         "http://localhost:5173",
         "*"
