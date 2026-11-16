@@ -40,7 +40,7 @@ elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 GEMINI_PRO_MODEL = os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro")
 JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)
 if not os.getenv("JWT_SECRET"):
@@ -273,10 +273,21 @@ class LoginRequest(BaseModel):
 
 class EvaluateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
-    content: str = Field(..., min_length=1, max_length=12000, validation_alias=AliasChoices("content", "text"))
+
+    content: str = Field(
+        ...,
+        min_length=1,
+        max_length=12000,
+        validation_alias=AliasChoices("content", "text")
+    )
     content_type: str = Field(default="text")
     image_base64: Optional[str] = None
-    model_preference: str = Field(default="auto", description="auto, gemini-2.5-flash, or gemini-2.5-pro")
+
+    model_preference: str = Field(
+        default="auto",
+        description="auto, gemini-3.8-flash, or gemini-2.5-pro"
+    )
+
     regulatory_preset: Optional[str] = None
     brand_rules: str = ""
     modules: list[str] = Field(default_factory=list)
