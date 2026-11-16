@@ -12,3 +12,7 @@ python-dotenv
 httpx
 tenacity
 psycopg[binary]
+Pillow
+numpy
+PyMuPDF
+python-docx

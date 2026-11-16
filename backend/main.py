@@ -42,7 +42,9 @@ elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_PRO_MODEL = os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro")
-JWT_SECRET = os.getenv("JWT_SECRET", "brandguard-enterprise-default-secret-key-2026")
+JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)
+if not os.getenv("JWT_SECRET"):
+    logger.warning("JWT_SECRET is unset; using an ephemeral local key. Configure a persistent JWT_SECRET in deployment.")
 JWT_ALGORITHM = "HS256"
 JWT_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))
 
@@ -59,7 +61,7 @@ MAX_IMAGE_BYTES = int(os.getenv("MAX_IMAGE_BYTES", str(5 * 1024 * 1024)))
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
 AUTH_REQUIRED_FOR_READS = os.getenv("AUTH_REQUIRED_FOR_READS", "false").lower() == "true"
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "brandguardadmin").replace("ADMIN_USERNAME=", "")
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "bpit123").replace("ADMIN_PASSWORD=", "")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").replace("ADMIN_PASSWORD=", "")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("brandguard")
@@ -110,6 +112,19 @@ class SubmissionORM(Base):
     stage2_ms: Mapped[float] = mapped_column(Float, default=0.0)
     total_ms: Mapped[float] = mapped_column(Float, default=1.0)
     gemini_status: Mapped[str] = mapped_column(String(100), default="deterministic")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
+class AuditEventORM(Base):
+    __tablename__ = "audit_events"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    event_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    submission_id: Mapped[str] = mapped_column(String(64), index=True)
+    event_type: Mapped[str] = mapped_column(String(80), nullable=False)
+    actor: Mapped[str] = mapped_column(String(200), default="system")
+    outcome: Mapped[str] = mapped_column(String(80), default="")
+    risk_score: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    details: Mapped[Any] = mapped_column(JSON, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
@@ -257,11 +272,14 @@ class LoginRequest(BaseModel):
 
 
 class EvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
     content: str = Field(..., min_length=1, max_length=12000, validation_alias=AliasChoices("content", "text"))
     content_type: str = Field(default="text")
     image_base64: Optional[str] = None
     model_preference: str = Field(default="auto", description="auto, gemini-2.5-flash, or gemini-2.5-pro")
     regulatory_preset: Optional[str] = None
+    brand_rules: str = ""
+    modules: list[str] = Field(default_factory=list)
 
 
 class RuleCreateRequest(BaseModel):
@@ -274,9 +292,9 @@ class RuleCreateRequest(BaseModel):
 
 class SignOffRequest(BaseModel):
     submission_id: str
-    version_hash: str
+    version_hash: str = Field(..., validation_alias=AliasChoices("version_hash", "expected_version_hash"))
     decision: str = "APPROVED"
-    reviewer: str = "Enterprise Compliance Lead"
+    reviewer: Optional[str] = None
 
 
 # ----------------------------- Core Endpoints -----------------------------
@@ -318,13 +336,37 @@ def readiness_check(db: Session = Depends(get_db)):
 
 @app.post("/auth/token")
 def login_for_token(payload: LoginRequest):
-    valid_users = {ADMIN_USERNAME, "brandguardadmin", "admin", "reviewer"}
-    valid_passwords = {ADMIN_PASSWORD, "brandguardadmin", "admin", "admin123", "password", "brandguard2026"}
-    if payload.username not in valid_users and payload.password not in valid_passwords:
+    if not ADMIN_PASSWORD:
+        raise HTTPException(status_code=503, detail="Reviewer login is not configured on the backend.")
+    valid_username = hmac.compare_digest(payload.username, ADMIN_USERNAME)
+    valid_password = hmac.compare_digest(payload.password, ADMIN_PASSWORD)
+    if not (valid_username and valid_password):
         raise HTTPException(status_code=401, detail="Invalid enterprise credentials")
+    role = os.getenv("ADMIN_ROLE", "admin").strip().lower()
+    if role not in {"admin", "legal"}:
+        role = "admin"
     exp = datetime.now(timezone.utc) + timedelta(minutes=JWT_MINUTES)
-    token = jwt.encode({"sub": payload.username, "exp": exp, "role": "admin"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    return {"access_token": token, "token": token, "token_type": "bearer", "expires_in_minutes": JWT_MINUTES, "username": payload.username, "role": "admin"}
+    token = jwt.encode({"sub": payload.username, "exp": exp, "role": role}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    user = {"username": payload.username, "display_name": payload.username, "role": role}
+    return {"access_token": token, "token": token, "token_type": "bearer",
+            "expires_in_minutes": JWT_MINUTES, "username": payload.username, "role": role, "user": user}
+
+
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+bearer_scheme = HTTPBearer(auto_error=False)
+
+
+def require_reviewer(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Reviewer authentication required.")
+    try:
+        claims = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Reviewer session is invalid or expired.")
+    role = str(claims.get("role", "")).lower()
+    if role not in {"admin", "legal"}:
+        raise HTTPException(status_code=403, detail="Legal/Admin role required.")
+    return {"username": str(claims.get("sub", "reviewer")), "role": role}
     
 
 @app.get("/rules")
@@ -396,6 +438,20 @@ async def evaluate_content(payload: EvaluateRequest, request: Request, db: Sessi
         except re.error:
             continue
 
+    # Apply simple explicit phrase restrictions supplied by the reviewer UI.
+    for line in (payload.brand_rules or "").splitlines():
+        match_rule = re.search(r"(?:never mention|do not mention|avoid mentioning)\s+(.+?)[.;]?$", line.strip(), re.IGNORECASE)
+        if match_rule:
+            phrase = re.sub(r"^(?:the rival|rival|competitor)\s+", "", match_rule.group(1), flags=re.IGNORECASE).strip().strip("\'\"")
+            found = re.search(re.escape(phrase), clean_text, re.IGNORECASE) if phrase else None
+            if found:
+                violations.append({"rule": "User-supplied brand rule", "severity": "HIGH",
+                                   "category": "Brand Integrity", "matched_text": found.group(0)})
+                evidence.append(f"Matched user-supplied brand restriction for '{phrase}'.")
+
+    if payload.image_base64:
+        raise HTTPException(status_code=501, detail="Image analysis is not enabled in this backend build. Submit text content only.")
+
     stage1_ms = round((time.perf_counter() - t_s1) * 1000, 2)
 
     base_risk = min(100, len(violations) * 35 + (50 if injection["sandbox_triggered"] else 0))
@@ -424,6 +480,8 @@ async def evaluate_content(payload: EvaluateRequest, request: Request, db: Sessi
             prompt = (
                 f"You are BrandGuard AI Enterprise Auditor powered by {chosen_model}.\n"
                 f"Evaluate the following content for brand safety, regulatory compliance, and tone.\n"
+                f"Reviewer-supplied brand rules: {payload.brand_rules or 'None supplied'}\n"
+                f"Requested review modules: {', '.join(payload.modules) if payload.modules else 'all configured checks'}\n"
                 f"Existing deterministic violations found: {json.dumps(violations)}\n"
                 f"Return strict JSON with keys: risk_score (int 0-100), explanation (str), sanitized_rewrite (str).\n"
                 f"Content: {clean_text}"
@@ -488,18 +546,19 @@ async def evaluate_content(payload: EvaluateRequest, request: Request, db: Sessi
     )
     try:
         db.add(record)
+        db.flush()
+        db.add(AuditEventORM(
+            event_id=f"evt-{uuid.uuid4().hex}", submission_id=sub_id,
+            event_type="REVIEW_COMPLETED", actor="system", outcome=status,
+            risk_score=base_risk,
+            details={"risk_level": risk_level, "version_id": version_id, "gemini_status": gemini_status},
+        ))
         db.commit()
         db.refresh(record)
     except Exception:
         db.rollback()
-        try:
-            SubmissionORM.__table__.drop(bind=db.get_bind(), checkfirst=True)
-            SubmissionORM.__table__.create(bind=db.get_bind(), checkfirst=True)
-            db.add(record)
-            db.commit()
-            db.refresh(record)
-        except Exception:
-            db.rollback()
+        logger.exception("Could not persist review and audit event")
+        raise HTTPException(status_code=500, detail="Review could not be saved to the audit database.")
     return serialize_submission(record)
 
 
@@ -510,12 +569,8 @@ def list_submissions(limit: int = Query(default=25, ge=1, le=100), db: Session =
         return [serialize_submission(r) for r in rows]
     except Exception:
         db.rollback()
-        try:
-            SubmissionORM.__table__.drop(bind=db.get_bind(), checkfirst=True)
-            SubmissionORM.__table__.create(bind=db.get_bind(), checkfirst=True)
-        except Exception:
-            pass
-        return []
+        logger.exception("Could not load submissions")
+        raise HTTPException(status_code=503, detail="Submission storage is temporarily unavailable.")
 
 
 @app.get("/analytics")
@@ -524,12 +579,8 @@ def get_analytics(db: Session = Depends(get_db)):
         rows = db.scalars(select(SubmissionORM).order_by(SubmissionORM.id.desc()).limit(100)).all()
     except Exception:
         db.rollback()
-        try:
-            SubmissionORM.__table__.drop(bind=db.get_bind(), checkfirst=True)
-            SubmissionORM.__table__.create(bind=db.get_bind(), checkfirst=True)
-        except Exception:
-            pass
-        rows = []
+        logger.exception("Could not load analytics")
+        raise HTTPException(status_code=503, detail="Analytics storage is temporarily unavailable.")
 
     total = len(rows)
     approved = sum(1 for r in rows if getattr(r, "status", "") == "APPROVED")
@@ -539,6 +590,12 @@ def get_analytics(db: Session = Depends(get_db)):
     avg_brand = round(sum(getattr(r, "brand_alignment_score", 100) or 100 for r in rows) / total, 1) if total else 100.0
     avg_latency = round(sum(getattr(r, "total_ms", 0) or 0 for r in rows) / total, 1) if total else 0.0
     items = [serialize_submission(r) for r in rows[:25]]
+    status_distribution = {}
+    risk_distribution = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+    for row in rows:
+        status_distribution[row.status] = status_distribution.get(row.status, 0) + 1
+        level = getattr(row, "risk_level", "LOW") or "LOW"
+        risk_distribution[level] = risk_distribution.get(level, 0) + 1
 
     return {
         "total_submissions": total,
@@ -557,7 +614,13 @@ def get_analytics(db: Session = Depends(get_db)):
         "average_risk_score": avg_risk,
         "avg_brand_score": avg_brand,
         "brand_alignment_avg": avg_brand,
+        "guideline_health_score": avg_brand,
         "avg_latency_ms": avg_latency,
+        "average_latency_ms": avg_latency,
+        "pipeline_latency_ms": avg_latency,
+        "threats_neutralized": flagged,
+        "status_distribution": status_distribution,
+        "risk_distribution": risk_distribution,
         "recent": items,
         "items": items,
         "logs": items,
@@ -580,19 +643,32 @@ def get_audit_trail(limit: int = Query(default=50, ge=1, le=200), db: Session = 
 
 
 @app.post("/sign-off")
-def sign_off_submission(payload: SignOffRequest, db: Session = Depends(get_db)):
-    try:
-        sub = db.scalar(select(SubmissionORM).where(SubmissionORM.submission_id == payload.submission_id))
-    except Exception:
-        db.rollback()
-        sub = None
+def sign_off_submission(
+    payload: SignOffRequest,
+    db: Session = Depends(get_db),
+    reviewer: dict[str, str] = Depends(require_reviewer),
+):
+    sub = db.scalar(select(SubmissionORM).where(SubmissionORM.submission_id == payload.submission_id))
     if not sub:
         raise HTTPException(status_code=404, detail="Submission not found")
-    if payload.version_hash and sub.version_hash and sub.version_hash != payload.version_hash:
+    if sub.status == "REJECTED":
+        raise HTTPException(status_code=409, detail="Rejected submissions must be corrected and re-reviewed; they cannot be signed off.")
+    if not hmac.compare_digest(sub.version_hash or "", payload.version_hash or ""):
         raise HTTPException(status_code=409, detail="Version hash mismatch! Content was modified after evaluation.")
-    sub.sign_off_status = f"{payload.decision.upper()}_BY_{payload.reviewer.upper().replace(' ', '_')}"
-    db.commit()
-    db.refresh(sub)
+    decision = payload.decision.upper()
+    sub.sign_off_status = f"{decision}_BY_{reviewer['username'].upper().replace(' ', '_')}"
+    try:
+        db.add(AuditEventORM(
+            event_id=f"evt-{uuid.uuid4().hex}", submission_id=sub.submission_id,
+            event_type="REVIEW_SIGNED_OFF", actor=reviewer["username"], outcome=decision,
+            risk_score=sub.risk_score,
+            details={"version_hash": sub.version_hash, "sign_off_status": sub.sign_off_status},
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception("Could not persist sign-off audit event")
+        raise HTTPException(status_code=500, detail="Sign-off could not be saved to the audit database.")
     return serialize_submission(sub)
 
 
@@ -629,19 +705,50 @@ def api_analytics_alias(db: Session = Depends(get_db)):
 @app.get("/api/logs")
 @app.get("/api/audit-trail")
 @app.get("/api/review/audit-trail")
-@app.get("/api/review/submissions")
-@app.get("/api/submissions")
-def api_logs_alias(limit: int = Query(default=50, ge=1, le=200), db: Session = Depends(get_db)):
-    items = list_submissions(limit=limit, db=db)
-    return {
-        "count": len(items),
-        "total": len(items),
-        "items": items,
-        "logs": items,
-        "submissions": items,
-        "records": items,
-        "data": items,
-    }
+def api_logs_alias(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    reviewer: dict[str, str] = Depends(require_reviewer),
+):
+    events = db.scalars(select(AuditEventORM).order_by(AuditEventORM.id.desc()).limit(limit)).all()
+    items = []
+    for event in events:
+        sub = db.scalar(select(SubmissionORM).where(SubmissionORM.submission_id == event.submission_id))
+        details = event.details or {}
+        items.append({
+            "event_id": event.event_id, "event_type": event.event_type,
+            "time": event.created_at.isoformat() if event.created_at else None,
+            "timestamp": event.created_at.isoformat() if event.created_at else None,
+            "created_at": event.created_at.isoformat() if event.created_at else None,
+            "actor": event.actor, "reviewer": event.actor, "action": event.event_type,
+            "outcome": event.outcome, "status": sub.status if sub else event.outcome,
+            "submission_id": event.submission_id,
+            "text_snippet": (sub.content[:140] + ("…" if len(sub.content) > 140 else "")) if sub else "",
+            "risk_score": event.risk_score,
+            "sign_off_status": sub.sign_off_status if sub else event.outcome,
+            "sha256_version_hash": sub.version_hash if sub else details.get("version_hash"),
+            "immutable_lock_hash": sub.version_hash if sub else details.get("version_hash"),
+            "details": details,
+        })
+    audited_ids = {item["submission_id"] for item in items}
+    legacy = db.scalars(select(SubmissionORM).order_by(SubmissionORM.id.desc()).limit(limit)).all()
+    for sub in legacy:
+        if sub.submission_id in audited_ids or len(items) >= limit:
+            continue
+        items.append({
+            "event_id": f"legacy-{sub.submission_id}", "event_type": "LEGACY_REVIEW_RECORD",
+            "time": sub.created_at.isoformat() if sub.created_at else None,
+            "timestamp": sub.created_at.isoformat() if sub.created_at else None,
+            "created_at": sub.created_at.isoformat() if sub.created_at else None,
+            "actor": "not recorded", "reviewer": "not recorded", "action": "LEGACY_REVIEW_RECORD",
+            "outcome": sub.status, "status": sub.status, "submission_id": sub.submission_id,
+            "text_snippet": sub.content[:140] + ("…" if len(sub.content) > 140 else ""),
+            "risk_score": sub.risk_score, "sign_off_status": sub.sign_off_status,
+            "sha256_version_hash": sub.version_hash, "immutable_lock_hash": sub.version_hash,
+            "details": {"note": "Historical submission; actor/event details were not captured at creation."},
+        })
+    return {"count": len(items), "total": len(items), "items": items, "logs": items,
+            "submissions": items, "records": items, "data": items}
 
 
 @app.get("/api/review/rules")
@@ -662,5 +769,9 @@ def api_rules_post_alias(payload: RuleCreateRequest, db: Session = Depends(get_d
 
 @app.post("/api/sign-off")
 @app.post("/api/review/sign-off")
-def api_sign_off_alias(payload: SignOffRequest, db: Session = Depends(get_db)):
-    return sign_off_submission(payload, db)
+def api_sign_off_alias(
+    payload: SignOffRequest,
+    db: Session = Depends(get_db),
+    reviewer: dict[str, str] = Depends(require_reviewer),
+):
+    return sign_off_submission(payload, db, reviewer)
