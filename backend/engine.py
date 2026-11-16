@@ -145,7 +145,7 @@ def run_ai_contextual_review(text: str, brand: BrandProfile, gemini_api_key: Opt
     Return a JSON list of findings matching the exact Finding schema.
     """
     response = client.models.generate_content(
-        model="gemini-3.8-flash",
+        model="gemini-2.5-flash",
         contents=prompt,
         config={"response_mime_type": "application/json", "response_schema": list[Finding]}
     )

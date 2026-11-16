@@ -18,7 +18,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import (JSON, Boolean, DateTime, Float, ForeignKey, Integer,
-                        String, Text, create_engine, func, select)
+                        String, Text, create_engine, func, inspect, select)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
@@ -32,7 +32,9 @@ except ImportError:
     GEMINI_AVAILABLE = False
 
 # ----------------------------- Configuration -----------------------------
-APP_VERSION = "4.1.0"
+APP_VERSION = "4.2.0"
+logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("brandguard")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./brandguard_local.db")
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
@@ -40,7 +42,7 @@ elif DATABASE_URL.startswith("postgresql://") and "+psycopg" not in DATABASE_URL
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_PRO_MODEL = os.getenv("GEMINI_PRO_MODEL", "gemini-2.5-pro")
 JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_urlsafe(48)
 if not os.getenv("JWT_SECRET"):
@@ -63,12 +65,18 @@ AUTH_REQUIRED_FOR_READS = os.getenv("AUTH_REQUIRED_FOR_READS", "false").lower() 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "brandguardadmin").replace("ADMIN_USERNAME=", "")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").replace("ADMIN_PASSWORD=", "")
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("brandguard")
-
 # ----------------------------- Database Models -----------------------------
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+connect_args = {"check_same_thread": False, "timeout": 30} if DATABASE_URL.startswith("sqlite") else {}
 engine = create_engine(DATABASE_URL, pool_pre_ping=True, connect_args=connect_args)
+
+if DATABASE_URL.startswith("sqlite"):
+    from sqlalchemy import event
+    @event.listens_for(engine, "connect")
+    def _sqlite_connection_pragmas(dbapi_connection, _connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 
@@ -128,7 +136,35 @@ class AuditEventORM(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
-Base.metadata.create_all(bind=engine)
+def initialize_database() -> None:
+    """Create missing tables and add missing columns without dropping user data.
+
+    SQLAlchemy create_all() does not alter an existing table. This small additive
+    migration handles that common deployment case; it deliberately never drops
+    or recreates existing tables.
+    """
+    Base.metadata.create_all(bind=engine)
+    inspector = inspect(engine)
+    preparer = engine.dialect.identifier_preparer
+    with engine.begin() as connection:
+        for table in Base.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {column["name"] for column in inspect(connection).get_columns(table.name)}
+            quoted_table = preparer.quote(table.name)
+            for column in table.columns:
+                if column.name in existing:
+                    continue
+                quoted_column = preparer.quote(column.name)
+                sql_type = column.type.compile(dialect=engine.dialect)
+                # Nullable additions are safe for pre-existing rows. ORM defaults
+                # populate the field for new inserts after the migration.
+                statement = f"ALTER TABLE {quoted_table} ADD COLUMN {quoted_column} {sql_type}"
+                logger.warning("Applying additive DB migration: %s.%s", table.name, column.name)
+                connection.exec_driver_sql(statement)
+
+
+initialize_database()
 
 
 def get_db():
@@ -176,7 +212,10 @@ def seed_default_rules():
             db.commit()
 
 
-seed_default_rules()
+try:
+    seed_default_rules()
+except Exception:
+    logger.exception("Default brand-rule seeding failed; API will remain available for diagnosis")
 
 # ----------------------------- Security & Sandbox -----------------------------
 PROMPT_INJECTION_PATTERNS = [
@@ -204,6 +243,9 @@ def detect_prompt_injection(text: str) -> dict[str, Any]:
 def serialize_submission(s: SubmissionORM) -> dict[str, Any]:
     return {
         "submission_id": s.submission_id,
+        "version_hash": s.version_hash,
+        "sha256_version_hash": s.version_hash,
+        "immutable_lock_hash": s.version_hash,
         "content": s.content,
         "content_type": s.content_type,
         "status": s.status,
@@ -273,21 +315,10 @@ class LoginRequest(BaseModel):
 
 class EvaluateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
-
-    content: str = Field(
-        ...,
-        min_length=1,
-        max_length=12000,
-        validation_alias=AliasChoices("content", "text")
-    )
+    content: str = Field(..., min_length=1, max_length=12000, validation_alias=AliasChoices("content", "text"))
     content_type: str = Field(default="text")
     image_base64: Optional[str] = None
-
-    model_preference: str = Field(
-        default="auto",
-        description="auto, gemini-3.8-flash, or gemini-2.5-pro"
-    )
-
+    model_preference: str = Field(default="auto", description="auto, gemini-2.5-flash, or gemini-2.5-pro")
     regulatory_preset: Optional[str] = None
     brand_rules: str = ""
     modules: list[str] = Field(default_factory=list)
@@ -321,28 +352,35 @@ def root():
 
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)):
-    total_eval = db.scalar(select(func.count(SubmissionORM.id))) or 0
-    active_rules = db.scalar(select(func.count(BrandRuleORM.id)).where(BrandRuleORM.active == True)) or 0
-    return {
-        "status": "healthy",
-        "healthy": True,
-        "version": APP_VERSION,
-        "gemini_active": GEMINI_AVAILABLE,
-        "active_models": [GEMINI_MODEL, GEMINI_PRO_MODEL],
-        "total_evaluated": total_eval,
-        "active_rules": active_rules,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    try:
+        total_eval = db.scalar(select(func.count(SubmissionORM.id))) or 0
+        active_rules = db.scalar(select(func.count(BrandRuleORM.id)).where(BrandRuleORM.active.is_(True))) or 0
+        return {
+            "status": "healthy", "healthy": True, "version": APP_VERSION,
+            "database": "connected", "gemini_active": GEMINI_AVAILABLE,
+            "active_models": [GEMINI_MODEL, GEMINI_PRO_MODEL],
+            "total_evaluated": total_eval, "active_rules": active_rules,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception:
+        db.rollback()
+        logger.exception("Health check database query failed")
+        raise HTTPException(status_code=503, detail="Database health check failed; inspect backend logs.")
 
 
 @app.get("/ready")
 def readiness_check(db: Session = Depends(get_db)):
     try:
         db.execute(select(1))
-        return {"status": "ready", "database": "connected", "gemini_active": GEMINI_AVAILABLE}
+        # Verify the actual application tables, not just the database socket.
+        db.scalar(select(func.count(SubmissionORM.id)))
+        db.scalar(select(func.count(BrandRuleORM.id)))
+        db.scalar(select(func.count(AuditEventORM.id)))
+        return {"status": "ready", "database": "connected", "schema": "available", "gemini_active": GEMINI_AVAILABLE}
     except Exception:
+        db.rollback()
         logger.exception("Readiness check failed")
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        raise HTTPException(status_code=503, detail="Database or application schema unavailable; inspect backend logs.")
 
 
 @app.post("/auth/token")
@@ -380,6 +418,14 @@ def require_reviewer(credentials: HTTPAuthorizationCredentials | None = Depends(
     return {"username": str(claims.get("sub", "reviewer")), "role": role}
     
 
+
+def optional_read_reviewer(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)):
+    if credentials is None:
+        if AUTH_REQUIRED_FOR_READS:
+            raise HTTPException(status_code=401, detail="Reviewer authentication required to read audit logs.")
+        return None
+    return require_reviewer(credentials)
+
 @app.get("/rules")
 def list_rules(db: Session = Depends(get_db)):
     rules = db.scalars(select(BrandRuleORM).order_by(BrandRuleORM.id.desc())).all()
@@ -407,10 +453,15 @@ def create_rule(payload: RuleCreateRequest, db: Session = Depends(get_db)):
         description=payload.description,
         active=True,
     )
-    db.add(rule)
-    db.commit()
-    db.refresh(rule)
-    return {"id": rule.id, "title": rule.title, "status": "created"}
+    try:
+        db.add(rule)
+        db.commit()
+        db.refresh(rule)
+        return {"id": rule.id, "title": rule.title, "status": "created"}
+    except Exception:
+        db.rollback()
+        logger.exception("Could not create brand rule")
+        raise HTTPException(status_code=503, detail="Brand rule could not be saved; inspect backend logs.")
 
 
 @app.post("/evaluate")
@@ -719,9 +770,15 @@ def api_analytics_alias(db: Session = Depends(get_db)):
 def api_logs_alias(
     limit: int = Query(default=50, ge=1, le=200),
     db: Session = Depends(get_db),
-    reviewer: dict[str, str] = Depends(require_reviewer),
+    reviewer: dict[str, str] | None = Depends(optional_read_reviewer),
 ):
-    events = db.scalars(select(AuditEventORM).order_by(AuditEventORM.id.desc()).limit(limit)).all()
+    try:
+        events = db.scalars(select(AuditEventORM).order_by(AuditEventORM.id.desc()).limit(limit)).all()
+        legacy = db.scalars(select(SubmissionORM).order_by(SubmissionORM.id.desc()).limit(limit)).all()
+    except Exception:
+        db.rollback()
+        logger.exception("Could not load audit trail")
+        raise HTTPException(status_code=503, detail="Audit database query failed; inspect backend logs.")
     items = []
     for event in events:
         sub = db.scalar(select(SubmissionORM).where(SubmissionORM.submission_id == event.submission_id))
@@ -734,7 +791,7 @@ def api_logs_alias(
             "actor": event.actor, "reviewer": event.actor, "action": event.event_type,
             "outcome": event.outcome, "status": sub.status if sub else event.outcome,
             "submission_id": event.submission_id,
-            "text_snippet": (sub.content[:140] + ("…" if len(sub.content) > 140 else "")) if sub else "",
+            "text_snippet": ((sub.content or "")[:140] + ("…" if len(sub.content or "") > 140 else "")) if sub else "",
             "risk_score": event.risk_score,
             "sign_off_status": sub.sign_off_status if sub else event.outcome,
             "sha256_version_hash": sub.version_hash if sub else details.get("version_hash"),
@@ -742,7 +799,6 @@ def api_logs_alias(
             "details": details,
         })
     audited_ids = {item["submission_id"] for item in items}
-    legacy = db.scalars(select(SubmissionORM).order_by(SubmissionORM.id.desc()).limit(limit)).all()
     for sub in legacy:
         if sub.submission_id in audited_ids or len(items) >= limit:
             continue
@@ -753,7 +809,7 @@ def api_logs_alias(
             "created_at": sub.created_at.isoformat() if sub.created_at else None,
             "actor": "not recorded", "reviewer": "not recorded", "action": "LEGACY_REVIEW_RECORD",
             "outcome": sub.status, "status": sub.status, "submission_id": sub.submission_id,
-            "text_snippet": sub.content[:140] + ("…" if len(sub.content) > 140 else ""),
+            "text_snippet": (sub.content or "")[:140] + ("…" if len(sub.content or "") > 140 else ""),
             "risk_score": sub.risk_score, "sign_off_status": sub.sign_off_status,
             "sha256_version_hash": sub.version_hash, "immutable_lock_hash": sub.version_hash,
             "details": {"note": "Historical submission; actor/event details were not captured at creation."},
