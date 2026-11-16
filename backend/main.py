@@ -385,20 +385,57 @@ def readiness_check(db: Session = Depends(get_db)):
 
 @app.post("/auth/token")
 def login_for_token(payload: LoginRequest):
+
+    logger.info("LOGIN DEBUG: username received = %r", payload.username)
+    logger.info("LOGIN DEBUG: configured username = %r", ADMIN_USERNAME)
+    logger.info("LOGIN DEBUG: password configured = %s", bool(ADMIN_PASSWORD))
+    logger.info("LOGIN DEBUG: username matches = %s",
+                hmac.compare_digest(payload.username, ADMIN_USERNAME))
+    logger.info("LOGIN DEBUG: password matches = %s",
+                hmac.compare_digest(payload.password, ADMIN_PASSWORD))
+
     if not ADMIN_PASSWORD:
-        raise HTTPException(status_code=503, detail="Reviewer login is not configured on the backend.")
+        raise HTTPException(
+            status_code=503,
+            detail="Reviewer login is not configured on the backend."
+        )
+
     valid_username = hmac.compare_digest(payload.username, ADMIN_USERNAME)
     valid_password = hmac.compare_digest(payload.password, ADMIN_PASSWORD)
+
     if not (valid_username and valid_password):
-        raise HTTPException(status_code=401, detail="Invalid enterprise credentials")
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid enterprise credentials"
+        )
+
     role = os.getenv("ADMIN_ROLE", "admin").strip().lower()
     if role not in {"admin", "legal"}:
         role = "admin"
+
     exp = datetime.now(timezone.utc) + timedelta(minutes=JWT_MINUTES)
-    token = jwt.encode({"sub": payload.username, "exp": exp, "role": role}, JWT_SECRET, algorithm=JWT_ALGORITHM)
-    user = {"username": payload.username, "display_name": payload.username, "role": role}
-    return {"access_token": token, "token": token, "token_type": "bearer",
-            "expires_in_minutes": JWT_MINUTES, "username": payload.username, "role": role, "user": user}
+
+    token = jwt.encode(
+        {"sub": payload.username, "exp": exp, "role": role},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM
+    )
+
+    user = {
+        "username": payload.username,
+        "display_name": payload.username,
+        "role": role
+    }
+
+    return {
+        "access_token": token,
+        "token": token,
+        "token_type": "bearer",
+        "expires_in_minutes": JWT_MINUTES,
+        "username": payload.username,
+        "role": role,
+        "user": user
+    }
 
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
